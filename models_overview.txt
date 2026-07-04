@@ -1,0 +1,87 @@
+=========================================================
+      AGENTIC RAG ARCHITECTURE: WORKFLOW & MODELS
+=========================================================
+This document outlines the step-by-step data flow and the 
+exact AI models powering your advanced RAG pipeline.
+
+---------------------------------------------------------
+PHASE A: THE INGESTION WORKFLOW
+---------------------------------------------------------
+1. Upload: You upload a document (.txt or .pdf) via Streamlit.
+2. Chunking: The document is parsed and split into overlapping 
+   blocks of text (1500 characters each with a 300-char overlap).
+3. Embedding: The "all-MiniLM-L6-v2" model translates these 
+   chunks into 384-dimensional mathematical arrays (vectors).
+4. Pinecone Cloud: The vectors are uploaded and stored securely 
+   in your Pinecone Cloud database.
+5. BM25 Backup: A raw text backup of the chunks is saved 
+   locally (chunks.pkl) specifically for keyword matching.
+
+---------------------------------------------------------
+PHASE B: THE RETRIEVAL & RERANKING WORKFLOW
+---------------------------------------------------------
+1. User Query: You ask a question (e.g., "What are my projects?").
+2. LLM Router: The Meta Llama-3.1 model intercepts the question, 
+   realizes it requires personal knowledge, and routes it to 
+   the RAG node.
+3. Hybrid Search:
+   - Dense: The query is embedded and Pinecone finds the top 
+     20 chunks that share the same "semantic meaning".
+   - Sparse: The BM25 algorithm searches the local backup for 
+     the top 20 chunks that contain exact "keyword matches".
+4. Deduplication: The 40 chunks are combined and duplicates 
+   are removed.
+5. CrossEncoder Reranking: The "ms-marco-MiniLM-L-6-v2" AI 
+   reads the query and the remaining chunks together, assigns 
+   a strict relevance score to each, and throws away everything 
+   except the absolute best 8 chunks.
+6. Final Generation: The Llama-3.1 model reads those 8 perfect 
+   chunks and generates your final answer.
+
+=========================================================
+                      MODEL BREAKDOWN
+=========================================================
+
+1. EMBEDDING MODEL (Vectorization)
+----------------------------------
+• Model Name: "all-MiniLM-L6-v2"
+• Source: HuggingFace / SentenceTransformers
+• Function: Converts text (both your documents and user 
+  queries) into 384-dimensional mathematical vectors. 
+  It is highly optimized for semantic similarity.
+
+2. RETRIEVAL MODELS (Hybrid Search)
+-----------------------------------
+A) DENSE RETRIEVER
+• Database: Pinecone Cloud
+• Function: Performs nearest-neighbor vector search in the 
+  cloud. It excels at finding documents that *mean* the same 
+  thing as the query, even if the exact words differ.
+
+B) SPARSE RETRIEVER
+• Algorithm: BM25 (Best Matching 25)
+• Function: A highly advanced keyword-matching algorithm. 
+  It excels at finding exact names, acronyms, or specific 
+  jargon that semantic search might miss.
+
+3. FINE-TUNED RE-RANKING MODEL (CrossEncoder)
+---------------------------------------------
+• Model Name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+• Source: HuggingFace (trained on Microsoft MARCO dataset)
+• Function: After Pinecone and BM25 retrieve the top 40 
+  candidates, this AI model acts as a highly intelligent 
+  judge. Because it is fine-tuned specifically for search 
+  relevance, it reads the query and the chunk *together* to 
+  determine true contextual relevance.
+
+4. LARGE LANGUAGE MODEL (LLM / Generation & Routing)
+----------------------------------------------------
+• Model Name: "llama-3.1-8b-instant"
+• Creator: Meta (Accessed via Groq API)
+• Function: 
+   1) Router: Acts as the "Brain" (Supervisor), analyzing 
+      the user's query and strictly deciding which tool to 
+      use (RAG, Web Search, Math, Python, or General Chat).
+   2) Generator: Takes the 8 perfect chunks provided by 
+      the CrossEncoder, applies your conversation history, 
+      and generates the final, hallucination-free response.

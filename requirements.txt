@@ -1,0 +1,20 @@
+# Phase 1-5 deps
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-huggingface>=0.0.3
+langchain-groq>=0.1.9
+langchain-core>=0.3.0
+langgraph>=0.2.34
+faiss-cpu
+pinecone
+sentence-transformers>=3.0.1
+pypdf>=4.3.1
+python-dotenv>=1.0.1
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+streamlit>=1.38.0
+requests>=2.32.3
+python-multipart>=0.0.9
+ragas==0.4.2
+datasets
+pandas

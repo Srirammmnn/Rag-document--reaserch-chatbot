@@ -1,0 +1,23 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+env/
+.pytest_cache/
+
+# Node/Frontend
+node_modules/
+dist/
+build/
+
+# Local Vectorstore data
+vectorstore/
+*.pkl
+*.faiss
+*.db
+
+# macOS
+.DS_Store

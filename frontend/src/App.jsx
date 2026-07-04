@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
 import './App.css';
 
-const API_URL = "http://localhost:8000";
+const API_URL = "/api";
 
 function App() {
   const [messages, setMessages] = useState([]);

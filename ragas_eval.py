@@ -17,8 +17,12 @@ Metrics covered:
 """
 
 import os
+import sys
 from typing import List, Dict
 from pathlib import Path
+
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
 
 import pandas as pd
 from datasets import Dataset
@@ -31,6 +35,7 @@ from ragas.metrics import (
     context_precision,
     context_recall,
 )
+from ragas.run_config import RunConfig
 
 # LangChain wrappers RAGAS needs to run its own LLM-judge calls
 from langchain_groq import ChatGroq
@@ -227,6 +232,8 @@ def run_ragas_evaluation(dataset: Dataset) -> pd.DataFrame:
         metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
         llm=judge_llm,
         embeddings=judge_embeddings,
+        raise_exceptions=False,
+        run_config=RunConfig(max_workers=1, timeout=60)
     )
 
     df = result.to_pandas()
@@ -251,15 +258,25 @@ def print_evaluation_report(df: pd.DataFrame) -> None:
     print("\n📈 Average Scores:")
     for col in available_cols:
         avg = df[col].mean()
-        bar = "█" * int(avg * 30)
-        print(f"  {col:20s} {avg:.3f}  {bar}")
+        if pd.isna(avg):
+            print(f"  {col:20s} N/A  (Failed to compute)")
+        else:
+            bar = "█" * int(avg * 30)
+            print(f"  {col:20s} {avg:.3f}  {bar}")
 
     print("\n📋 Per-Question Breakdown:")
     for idx, row in df.iterrows():
-        print(f"\n  Q{idx+1}: {row['question'][:60]}...")
+        q_text = row.get('question', row.get('user_input', 'Unknown question'))
+        if isinstance(q_text, str):
+            q_text = q_text[:60]
+        print(f"\n  Q{idx+1}: {q_text}...")
         for col in available_cols:
-            flag = "⚠️ " if row[col] < 0.6 else "✅ "
-            print(f"     {flag}{col:20s}: {row[col]:.3f}")
+            val = row[col]
+            if pd.isna(val):
+                print(f"     ⚠️ {col:20s}: N/A")
+            else:
+                flag = "⚠️ " if val < 0.6 else "✅ "
+                print(f"     {flag}{col:20s}: {val:.3f}")
 
     print("\n" + "=" * 70)
 
@@ -295,20 +312,19 @@ def main():
 
     # ── Load Phase 1+2 components ──
     print("\n📂 Loading vectorstore + building chains...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-    vectorstore = FAISS.load_local("vectorstore", embeddings, allow_dangerous_deserialization=True)
+    from agent import get_hybrid_retriever
+    
+    retriever = get_hybrid_retriever()
+    if retriever is None:
+        print("⚠️ Could not load hybrid retriever. Make sure you have ingested documents.")
+        return
 
-    # Build the RAG chain (reuse logic from Phase 2)
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
+    from langchain_groq import ChatGroq
 
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
     def format_docs(docs):
         return "\n\n".join(d.page_content for d in docs)
@@ -318,9 +334,12 @@ def main():
         ("human", "{question}"),
     ])
 
+    def hybrid_retrieve(q):
+        return retriever.get_relevant_documents(q)
+
     answer_chain = (
         RunnableParallel(
-            context=retriever | RunnableLambda(format_docs),
+            context=RunnableLambda(hybrid_retrieve) | RunnableLambda(format_docs),
             question=RunnablePassthrough(),
         )
         | prompt

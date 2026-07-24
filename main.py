@@ -1,441 +1,245 @@
 """
-Phase 4: FastAPI Backend
-=========================
-Exposes the Phase 1-3 pipeline (ingestion + RAG + LangGraph agent) as a REST API.
-
-Endpoints:
-  POST /ingest         -> upload a PDF/TXT, runs Phase 1 ingestion pipeline
-  POST /chat           -> ask a question, returns full JSON answer (blocking)
-  POST /chat/stream     -> ask a question, streams the agent's reasoning via SSE
-  GET  /health          -> liveness check
-  GET  /sources         -> list ingested documents currently in the vectorstore
-
-Run with:
-  uvicorn main:app --reload --port 8000
+Phase 4 & Production FastAPI Backend Server
+===========================================
+Exposes Production RAG System APIs:
+  - POST /ingest             -> Upload document, run semantic chunking & hybrid indexing
+  - POST /chat               -> Blocking RAG Q&A with grounded answers & citations
+  - POST /chat/stream        -> Real-time SSE streaming of thinking, answer tokens, and verified citations
+  - GET  /retrieval/inspect  -> Side-by-side diagnostic inspection of Dense vs BM25 vs RRF vs Reranker
+  - POST /verify-citation    -> Standalone citation & claim verification
+  - GET  /sources            -> List active documents & chunk statistics
+  - GET  /health             -> Backend health & vectorstore status check
 """
 
 import os
 import sys
 import json
-
-# Force UTF-8 output for Windows terminals to avoid emoji printing crashes
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout.reconfigure(encoding='utf-8')
-
+import pickle
 import shutil
 import asyncio
 from pathlib import Path
-from typing import List, Optional, AsyncGenerator
+from typing import List, Dict, Any, Optional, AsyncGenerator
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-# LangChain / LangGraph imports
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from langchain_pinecone import Pinecone
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+
+from ingest import run_ingestion_pipeline, delete_document_from_stores, get_embedding_model
+from agent import build_agent_graph, init_retriever, get_hybrid_retriever, _hybrid_retriever_singleton
+import agent as agent_module
+from citation_verifier import verify_claims_against_sources
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# Import the Phase 3 agent graph builder
-# (In your real project structure, this would be: from agent import build_agent_graph)
-# sys.path logic removed as files are now in a single directory
-
 
 # ─────────────────────────────────────────────
-# APP SETUP
+# FASTAPI APP SETUP
 # ─────────────────────────────────────────────
 
 app = FastAPI(
-    title="AI Research Assistant API",
-    description="RAG + LangGraph agent backend — Phase 4 of the AI/ML learning project (updated)",
-    version="1.0.0",
+    title="NeuRAG Production Engine API",
+    description="Production-grade RAG System with Hybrid Search (Dense + BM25 + RRF + Cross-Encoder) & Citation Verification",
+    version="2.0.0",
 )
 
-# CORS — required so Streamlit (different port) can call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # restrict to your frontend's origin in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-VECTORSTORE_PATH = str(Path(__file__).parent / "vectorstore")
+VECTORSTORE_PATH = Path(__file__).parent / "vectorstore"
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Module-level singletons — loaded once, reused across requests
-_embeddings = None
-_vectorstore = None
 _agent_graph = None
 
-
-# ─────────────────────────────────────────────
-# REQUEST / RESPONSE SCHEMAS (Pydantic)
-# ─────────────────────────────────────────────
-
-class ChatRequest(BaseModel):
-    question: str = Field(..., min_length=1, description="The user's question")
-    session_id: Optional[str] = Field(default="default", description="Conversation session ID")
-
-
-class ChatResponse(BaseModel):
-    question: str
-    answer: str
-    sources: List[str] = []
-    tool_calls_made: List[str] = []
-
-
-class IngestResponse(BaseModel):
-    filename: str
-    chunks_added: int
-    total_vectors: int
-    status: str
-
-
-class HealthResponse(BaseModel):
-    status: str
-    vectorstore_loaded: bool
-    total_vectors: int
-
-
-# ─────────────────────────────────────────────
-# LAZY-LOADED SINGLETONS
-# ─────────────────────────────────────────────
-
-def get_embeddings() -> HuggingFaceEmbeddings:
-    """Load embedding model once, reuse across all requests."""
-    global _embeddings
-    if _embeddings is None:
-        print("🤖 Loading embedding model (first request only)...")
-        _embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
-        )
-    return _embeddings
-
-
-def get_vectorstore() -> Optional[Pinecone]:
-    """Connect to Pinecone cloud vector database."""
-    global _vectorstore
-    if _vectorstore is None:
-        pinecone_api_key = os.environ.get("PINECONE_API_KEY")
-        index_name = os.environ.get("PINECONE_INDEX_NAME")
-        if not pinecone_api_key or not index_name:
-            print("⚠️ Pinecone credentials missing. Add PINECONE_API_KEY and PINECONE_INDEX_NAME to .env")
-            return None
-            
-        print("📂 Connecting to Pinecone vector store...")
-        try:
-            _vectorstore = Pinecone(index_name=index_name, embedding=get_embeddings())
-        except Exception as e:
-            print(f"⚠️ Pinecone connection failed: {e}")
-            return None
-    return _vectorstore
-
-
 def get_agent_graph():
-    """
-    Build (or reuse) the compiled LangGraph agent.
-    This is the SAME graph from Phase 3 — wrapped here for API use.
-    """
     global _agent_graph
     if _agent_graph is None:
-        print("🏗️  Building agent graph...")
-        from agent import build_agent_graph  # Phase 3 module
+        print("🏗️ Building LangGraph agent graph...")
         _agent_graph = build_agent_graph()
     return _agent_graph
 
 
 # ─────────────────────────────────────────────
-# IN-MEMORY SESSION STORE (for conversation history)
+# REDIS / IN-MEMORY CACHE & SESSION HISTORY
 # ─────────────────────────────────────────────
-# Production note: replace with Redis or a DB for multi-instance deployments.
+import redis
+REDIS_CLIENT = None
+try:
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    temp_client = redis.from_url(redis_url, socket_timeout=1)
+    temp_client.ping()
+    REDIS_CLIENT = temp_client
+    print("🟢 Redis connected for enterprise session storage.")
+except Exception:
+    print("🟡 Redis not available. Utilizing in-memory session store.")
+    REDIS_CLIENT = None
 
-SESSIONS: dict = {}  # {session_id: List[BaseMessage]}
+SESSIONS: Dict[str, list] = {}
+SEMANTIC_CACHE: list = []
 
 def get_session_history(session_id: str) -> list:
-    if session_id not in SESSIONS:
-        SESSIONS[session_id] = []
-    return SESSIONS[session_id]
+    if REDIS_CLIENT:
+        data = REDIS_CLIENT.get(f"session:{session_id}")
+        return pickle.loads(data) if data else []
+    return SESSIONS.get(session_id, [])
 
-# ─────────────────────────────────────────────
-# SEMANTIC CACHE
-# (Cleared on server reload)
-# ─────────────────────────────────────────────
-
-SEMANTIC_CACHE = []  # List of tuples: (query_embedding, final_answer)
-
-def check_semantic_cache(question: str, threshold: float = 0.98):
-    """Check if a similar query exists in cache and return its answer."""
-    if not SEMANTIC_CACHE: return None
-    
-    emb_model = get_embeddings()
-    query_emb = emb_model.embed_query(question)
-    
-    max_sim = -1.0
-    best_ans = None
-    
-    for cached_emb, ans in SEMANTIC_CACHE:
-        # dot product (vectors are normalized)
-        sim = sum(a * b for a, b in zip(query_emb, cached_emb))
-        if sim > max_sim:
-            max_sim = sim
-            best_ans = ans
-            
-    if max_sim >= threshold:
-        print(f"⚡ Semantic cache hit! Similarity: {max_sim:.3f}")
-        return best_ans
-    return None
-
-def add_to_semantic_cache(question: str, answer: str):
-    emb_model = get_embeddings()
-    query_emb = emb_model.embed_query(question)
-    SEMANTIC_CACHE.append((query_emb, answer))
-    if len(SEMANTIC_CACHE) > 200:
-        SEMANTIC_CACHE.pop(0)
+def save_session_history(session_id: str, messages: list):
+    if REDIS_CLIENT:
+        REDIS_CLIENT.set(f"session:{session_id}", pickle.dumps(messages), ex=86400)
+    else:
+        SESSIONS[session_id] = messages
 
 
 # ─────────────────────────────────────────────
-# ENDPOINT 1: HEALTH CHECK
+# PYDANTIC SCHEMAS
+# ─────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    question: str = Field(..., min_length=1, description="User question")
+    session_id: Optional[str] = Field(default="default", description="Session UUID")
+
+class CitationItem(BaseModel):
+    citation_id: int
+    source: str
+    page: int
+    claim: str
+    snippet: str
+    grounded: bool
+    confidence_score: float
+
+class RetrievalDiagnosticItem(BaseModel):
+    citation_id: int
+    source: str
+    page: int
+    dense_rank: Optional[int]
+    bm25_rank: Optional[int]
+    rrf_score: Optional[float]
+    cross_encoder_score: Optional[float]
+    snippet: str
+
+class ChatResponse(BaseModel):
+    question: str
+    answer: str
+    sources: List[str] = []
+    citations: List[CitationItem] = []
+    groundedness_score: float = 1.0
+    retrieval_diagnostics: List[RetrievalDiagnosticItem] = []
+    tool_calls_made: List[str] = []
+
+class HealthResponse(BaseModel):
+    status: str
+    vectorstore_loaded: bool
+    total_chunks: int
+
+class VerifyCitationRequest(BaseModel):
+    answer: str
+    context_texts: List[str]
+
+
+# ─────────────────────────────────────────────
+# ENDPOINTS
 # ─────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    """Liveness check — also reports whether the knowledge base is ready."""
-    vs = get_vectorstore()
+    retriever = get_hybrid_retriever()
+    chunks_path = VECTORSTORE_PATH / "chunks.pkl"
+    total_chunks = 0
+    if chunks_path.exists():
+        try:
+            with open(chunks_path, "rb") as f:
+                chunks = pickle.load(f)
+            total_chunks = len(chunks)
+        except Exception:
+            pass
+
     return HealthResponse(
         status="ok",
-        vectorstore_loaded=vs is not None,
-        total_vectors=-1, # Pinecone does not expose local ntotal
+        vectorstore_loaded=retriever is not None,
+        total_chunks=total_chunks,
     )
 
 
-# ─────────────────────────────────────────────
-# ENDPOINT 2: INGEST A DOCUMENT
-# ─────────────────────────────────────────────
-
-@app.post("/ingest", response_model=IngestResponse)
+@app.post("/ingest")
 async def ingest_document(file: UploadFile = File(...)):
-    """
-    Upload a PDF or TXT file.
+    if not file.filename.lower().endswith((".pdf", ".txt", ".md")):
+        raise HTTPException(status_code=400, detail="Only .pdf, .txt, and .md files are supported.")
 
-    Full pipeline for every upload:
-      1. Parse & chunk the document
-      2. Remove any old vectors for this filename from Pinecone (safe re-upload)
-      3. Embed & push new chunks to Pinecone
-      4. Deduplicate & save chunks.pkl (for BM25)
-      5. Rebuild the in-memory BM25 + Pinecone retriever singleton instantly
-         so RAG questions work immediately — no server restart needed
-    """
-    global _vectorstore
-
-    if not file.filename.lower().endswith((".pdf", ".txt")):
-        raise HTTPException(status_code=400, detail="Only .pdf and .txt files are supported")
-
-    # ── Keep a permanent copy so files survive server restarts ──
     file_path = UPLOAD_DIR / file.filename
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
     try:
-        # ── 1. Load & Split ──
-        if file.filename.lower().endswith(".pdf"):
-            loader = PyPDFLoader(str(file_path))
-        else:
-            loader = TextLoader(str(file_path), encoding="utf-8")
-        documents = loader.load()
+        res = run_ingestion_pipeline(file_path, VECTORSTORE_PATH)
 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
-        new_chunks = splitter.split_documents(documents)
-        for chunk in new_chunks:
-            chunk.metadata["source"] = file.filename
+        # Invalidate retriever singleton and reinitialize
+        agent_module._hybrid_retriever_singleton = None
+        init_retriever()
 
-        if not new_chunks:
-            raise HTTPException(status_code=400, detail="Document produced 0 chunks. Is it empty?")
-
-        print(f"  📄 Loaded '{file.filename}' → {len(new_chunks)} chunks")
-
-        # ── 2. Pinecone: delete old vectors for this source, then add new ──
-        pinecone_api_key = os.environ.get("PINECONE_API_KEY")
-        index_name = os.environ.get("PINECONE_INDEX_NAME")
-        if not pinecone_api_key or not index_name:
-            raise HTTPException(status_code=500, detail="Pinecone credentials missing in .env")
-
-        embeddings = get_embeddings()
-
-        # Try to delete old vectors for this source (metadata filter)
-        try:
-            from pinecone import Pinecone as PineconeClient
-            pc = PineconeClient(api_key=pinecone_api_key)
-            idx = pc.Index(index_name)
-            idx.delete(filter={"source": file.filename})
-            print(f"  🗑️  Cleared old Pinecone vectors for '{file.filename}'")
-        except Exception as del_err:
-            print(f"  ⚠️  Could not delete old Pinecone vectors (OK on first upload): {del_err}")
-
-        # Upload new vectors
-        vs = Pinecone(index_name=index_name, embedding=embeddings)
-        vs.add_documents(new_chunks)
-        _vectorstore = vs
-        print(f"  ☁️  Pushed {len(new_chunks)} vectors to Pinecone")
-
-        # ── 3. chunks.pkl: remove old entries for this source, add new ──
-        import pickle
-        chunks_path = Path(VECTORSTORE_PATH) / "chunks.pkl"
-        chunks_path.parent.mkdir(parents=True, exist_ok=True)
-
-        existing_chunks = []
-        if chunks_path.exists():
-            with open(chunks_path, "rb") as f:
-                try:
-                    existing_chunks = pickle.load(f)
-                except Exception:
-                    existing_chunks = []
-
-        # Remove stale chunks from the same file
-        existing_chunks = [c for c in existing_chunks if c.metadata.get("source") != file.filename]
-        existing_chunks.extend(new_chunks)
-
-        with open(chunks_path, "wb") as f:
-            pickle.dump(existing_chunks, f)
-        print(f"  💾 chunks.pkl updated → {len(existing_chunks)} total chunks across all docs")
-
-        # ── 4. Rebuild BM25 + Retriever singleton immediately ──
-        # This is what makes new docs instantly searchable without a server restart.
-        import agent as agent_module
-        agent_module._hybrid_retriever = None   # invalidate stale singleton
-        agent_module.init_retriever()           # rebuild from fresh chunks.pkl
-        print(f"  ✅ Retriever singleton rebuilt — '{file.filename}' is now searchable!")
-
-        # ── 5. Invalidate semantic cache (old answers may be stale) ──
-        global SEMANTIC_CACHE
-        SEMANTIC_CACHE.clear()
-        print("  🧹 Semantic cache cleared")
-
-        # Count unique sources now in the store
-        sources_in_store = list({c.metadata.get("source", "?") for c in existing_chunks})
-
-        return IngestResponse(
-            filename=file.filename,
-            chunks_added=len(new_chunks),
-            total_vectors=len(existing_chunks),
-            status=f"success — {len(sources_in_store)} document(s) in knowledge base: {sources_in_store}",
-        )
-
-    except HTTPException:
-        raise
+        return {
+            "filename": file.filename,
+            "chunks_added": res["chunks_added"],
+            "total_chunks": res["total_chunks"],
+            "status": "success",
+        }
     except Exception as e:
         import traceback
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
-    # NOTE: We intentionally do NOT delete file_path here — keep it in uploads/
-    # so the server can re-ingest on next startup if needed.
 
-
-
-
-# ─────────────────────────────────────────────
-# ENDPOINT 3: CHAT (BLOCKING — full response at once)
-# ─────────────────────────────────────────────
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """
-    Ask the agent a question. Waits for the full agent loop to complete
-    (including any tool calls) before returning the final answer.
-
-    Use this when you don't need real-time streaming (e.g. programmatic API calls).
-    """
-    if get_vectorstore() is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No documents ingested yet. Call POST /ingest first."
-        )
-        
-    cached_answer = check_semantic_cache(request.question)
-    if cached_answer:
-        return ChatResponse(
-            question=request.question,
-            answer=cached_answer,
-            sources=["semantic_cache"],
-            tool_calls_made=[],
-        )
-
     graph = get_agent_graph()
     raw_history = get_session_history(request.session_id)
 
-    # Only pass clean Human+AI turns — strip ToolMessages and synthetic AIMessages
-    # that carry tool_calls. These confuse the rag_node message index lookup.
     clean_history = [
         msg for msg in raw_history
         if isinstance(msg, (HumanMessage, AIMessage)) and not getattr(msg, "tool_calls", None)
     ]
 
-    # Run the LangGraph agent loop
     result = graph.invoke({
         "messages": clean_history + [HumanMessage(content=request.question)]
     })
 
     messages = result["messages"]
     final_message = messages[-1]
+    citations = result.get("citations", [])
+    groundedness_score = result.get("groundedness_score", 1.0)
+    diagnostics = result.get("retrieval_diagnostics", [])
 
-    # Extract which tools were called during this run (for transparency)
+    sources = list({c["source"] for c in citations if "source" in c})
     tool_calls_made = []
-    sources = set()
     for msg in messages:
         if isinstance(msg, AIMessage) and msg.tool_calls:
             tool_calls_made.extend([tc["name"] for tc in msg.tool_calls])
-        if isinstance(msg, ToolMessage) and msg.name == "search_knowledge_base":
-            # crude source extraction from the tool output text
-            for line in str(msg.content).split("\n"):
-                if "(source:" in line:
-                    src = line.split("(source:")[1].split(")")[0].strip()
-                    sources.add(src)
 
-    # Update session history (keep last 10 turns)
-    SESSIONS[request.session_id] = messages[-20:]
-    
-    # Save to semantic cache only if the route is RAG or general LLM
-    # (math, python, and web results should always execute dynamically)
-    route = result.get("route")
-    if route in {"rag", "llm"}:
-        add_to_semantic_cache(request.question, final_message.content)
-        print(f"  💾 Saved query to semantic cache (route: {route})")
+    save_session_history(request.session_id, messages[-20:])
 
     return ChatResponse(
         question=request.question,
         answer=final_message.content,
-        sources=list(sources),
+        sources=sources,
+        citations=citations,
+        groundedness_score=groundedness_score,
+        retrieval_diagnostics=diagnostics,
         tool_calls_made=tool_calls_made,
     )
 
 
-# ─────────────────────────────────────────────
-# ENDPOINT 4: CHAT STREAMING (SSE)
-# ─────────────────────────────────────────────
-
 async def agent_event_stream(question: str, session_id: str) -> AsyncGenerator[str, None]:
-    """
-    Generator that yields Server-Sent Events as the agent executes.
-
-    SSE format: each event is a line "data: {json}\\n\\n"
-    The client (Streamlit/JS) reads these incrementally and updates the UI live.
-
-    Event types emitted:
-      "tool_call"  -> agent decided to call a tool (shown as "thinking..." in UI)
-      "tool_result"-> a tool finished executing
-      "token"      -> a chunk of the final answer (if using token streaming)
-      "done"       -> final answer is complete
-      "error"      -> something went wrong
-    """
     graph = get_agent_graph()
     raw_history = get_session_history(session_id)
     clean_history = [
@@ -445,23 +249,27 @@ async def agent_event_stream(question: str, session_id: str) -> AsyncGenerator[s
 
     try:
         final_answer = ""
-        route_destination = None
+        citations = []
+        groundedness_score = 1.0
+        diagnostics = []
+
         all_messages = clean_history + [HumanMessage(content=question)]
 
         async for step in graph.astream({"messages": all_messages}):
             for node_name, node_output in step.items():
-                if node_name == "router":
-                    route_destination = node_output.get("route")
-                for msg in node_output["messages"]:
+                if "citations" in node_output and node_output["citations"]:
+                    citations = node_output["citations"]
+                    groundedness_score = node_output.get("groundedness_score", 1.0)
+                    diagnostics = node_output.get("retrieval_diagnostics", [])
 
+                    yield f"data: {json.dumps({'type': 'citations', 'citations': citations, 'groundedness_score': groundedness_score})}\n\n"
+                    yield f"data: {json.dumps({'type': 'diagnostics', 'diagnostics': diagnostics})}\n\n"
+
+                for msg in node_output.get("messages", []):
                     if isinstance(msg, AIMessage):
                         if msg.tool_calls:
                             for tc in msg.tool_calls:
-                                event = {
-                                    "type": "tool_call",
-                                    "tool": tc["name"],
-                                    "args": tc["args"],
-                                }
+                                event = {"type": "tool_call", "tool": tc["name"], "args": tc["args"]}
                                 yield f"data: {json.dumps(event)}\n\n"
                         else:
                             final_answer = msg.content
@@ -469,26 +277,14 @@ async def agent_event_stream(question: str, session_id: str) -> AsyncGenerator[s
                             yield f"data: {json.dumps(event)}\n\n"
 
                     elif isinstance(msg, ToolMessage):
-                        event = {
-                            "type": "tool_result",
-                            "tool": msg.name,
-                            "result_preview": str(msg.content)[:200],
-                        }
+                        event = {"type": "tool_result", "tool": msg.name, "result_preview": str(msg.content)[:200]}
                         yield f"data: {json.dumps(event)}\n\n"
 
-        # Update session history
         if final_answer:
             raw_history.append(HumanMessage(content=question))
             raw_history.append(AIMessage(content=final_answer))
-            if len(raw_history) > 20:
-                raw_history[:] = raw_history[-20:]
-            
-            # Save to semantic cache only if the route is RAG or general LLM
-            if route_destination in {"rag", "llm"}:
-                add_to_semantic_cache(question, final_answer)
-                print(f"  💾 Saved streaming query to semantic cache (route: {route_destination})")
+            save_session_history(session_id, raw_history[-20:])
 
-        # Signal completion
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     except Exception as e:
@@ -497,63 +293,43 @@ async def agent_event_stream(question: str, session_id: str) -> AsyncGenerator[s
 
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
-    """
-    Streaming version of /chat using Server-Sent Events (SSE).
-
-    The client receives events as the agent works:
-      1. {"type": "tool_call", "tool": "search_knowledge_base", ...}  <- agent decided to search
-      2. {"type": "tool_result", "tool": "search_knowledge_base", ...} <- search completed
-      3. {"type": "answer", "content": "RAG stands for..."}            <- final answer
-      4. {"type": "done"}                                               <- stream complete
-
-    This lets the UI show "Searching knowledge base..." then "Thinking..."
-    then stream in the final answer — much better UX than waiting in silence.
-    """
-    if get_vectorstore() is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No documents ingested yet. Call POST /ingest first."
-        )
-        
-    cached_answer = check_semantic_cache(request.question)
-    if cached_answer:
-        async def cached_stream():
-            yield f"data: {json.dumps({'type': 'answer', 'content': cached_answer})}\n\n"
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
-            
-        # Update session history even for cached responses
-        raw_history = get_session_history(request.session_id)
-        raw_history.append(HumanMessage(content=request.question))
-        raw_history.append(AIMessage(content=cached_answer))
-        if len(raw_history) > 20:
-            raw_history[:] = raw_history[-20:]
-            
-        return StreamingResponse(
-            cached_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-        )
-
     return StreamingResponse(
         agent_event_stream(request.question, request.session_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # disable nginx buffering for real-time streaming
+            "X-Accel-Buffering": "no",
         },
     )
 
 
-# ─────────────────────────────────────────────
-# ENDPOINT 5: LIST SOURCES
-# ─────────────────────────────────────────────
+@app.get("/retrieval/inspect")
+async def inspect_retrieval(query: str = Query(..., description="Query to inspect hybrid search scores")):
+    retriever = get_hybrid_retriever()
+    if retriever is None:
+        raise HTTPException(status_code=400, detail="Retriever not initialized.")
+
+    scored_results = retriever.get_relevant_documents_with_scores(query)
+    diagnostics = []
+    for doc, meta in scored_results:
+        diagnostics.append({
+            "citation_id": meta.get("final_rank"),
+            "source": doc.metadata.get("source", "unknown"),
+            "page": doc.metadata.get("page", 1),
+            "dense_rank": meta.get("dense_rank"),
+            "bm25_rank": meta.get("bm25_rank"),
+            "rrf_score": meta.get("rrf_score"),
+            "cross_encoder_score": meta.get("cross_encoder_score"),
+            "content_preview": doc.page_content[:200] + "...",
+        })
+
+    return {"query": query, "total_retrieved": len(diagnostics), "diagnostics": diagnostics}
+
 
 @app.get("/sources")
 async def list_sources():
-    """List the unique document sources currently in the knowledge base."""
-    import pickle
-    chunks_path = Path(VECTORSTORE_PATH) / "chunks.pkl"
+    chunks_path = VECTORSTORE_PATH / "chunks.pkl"
     if not chunks_path.exists():
         return {"sources": [], "total_chunks": 0}
 
@@ -566,70 +342,40 @@ async def list_sources():
         return {"sources": [], "total_chunks": 0}
 
 
-# ─────────────────────────────────────────────
-# ENDPOINT 6: CLEAR SESSION
-# ─────────────────────────────────────────────
+@app.delete("/sources/{filename}")
+async def delete_source(filename: str):
+    try:
+        res = delete_document_from_stores(filename, VECTORSTORE_PATH)
+        agent_module._hybrid_retriever_singleton = None
+        init_retriever()
+        return {
+            "status": "success",
+            "filename": filename,
+            "details": res
+        }
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Deletion failed: {str(e)}")
+
 
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
-    """Clear conversation history for a session (start fresh)."""
-    SESSIONS.pop(session_id, None)
+    if REDIS_CLIENT:
+        REDIS_CLIENT.delete(f"session:{session_id}")
+    else:
+        SESSIONS.pop(session_id, None)
     return {"status": "cleared", "session_id": session_id}
 
-
-# ─────────────────────────────────────────────
-# STARTUP EVENT — preload models so first request isn't slow
-# ─────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup_event():
     print("\n" + "=" * 60)
-    print("  🚀 AI Research Assistant API starting up")
+    print("  🚀 NeuRAG Production API Starting Up")
     print("=" * 60)
-    get_embeddings()       # preload embedding model
-    get_vectorstore()      # preload vectorstore if it exists
-
-    # Preload cross encoder + retriever singleton
-    from agent import load_cross_encoder, init_retriever
-    load_cross_encoder()
-    init_retriever()   # build BM25 + connect Pinecone ONCE here, not per-request
-
-    # ── Auto-restore: re-ingest any files in uploads/ that are missing from chunks.pkl ──
-    # This ensures documents survive server restarts without manual re-upload.
-    import pickle
-    chunks_path = Path(VECTORSTORE_PATH) / "chunks.pkl"
-    already_indexed = set()
-    if chunks_path.exists():
-        try:
-            with open(chunks_path, "rb") as f:
-                existing = pickle.load(f)
-            already_indexed = {c.metadata.get("source") for c in existing}
-        except Exception:
-            pass
-
-    uploads = list(UPLOAD_DIR.glob("*.pdf")) + list(UPLOAD_DIR.glob("*.txt"))
-    missing = [u for u in uploads if u.name not in already_indexed]
-    if missing:
-        print(f"  🔄 Re-ingesting {len(missing)} file(s) missing from knowledge base: {[u.name for u in missing]}")
-        from fastapi.datastructures import UploadFile as FUploadFile
-        import io
-        for fpath in missing:
-            try:
-                with open(fpath, "rb") as raw:
-                    content = raw.read()
-                mock_file = UploadFile(
-                    filename=fpath.name,
-                    file=io.BytesIO(content),
-                )
-                await ingest_document(mock_file)
-                print(f"    ✅ Re-ingested: {fpath.name}")
-            except Exception as e:
-                print(f"    ⚠️ Failed to re-ingest {fpath.name}: {e}")
-    else:
-        print("  ✅ All uploaded files are already indexed")
-
-    print("  ✅ Ready to accept requests")
-    print("  📚 Docs: http://localhost:8000/docs")
+    get_embedding_model()
+    init_retriever()
+    print("  ✅ Backend ready at http://localhost:8000")
     print("=" * 60 + "\n")
 
 

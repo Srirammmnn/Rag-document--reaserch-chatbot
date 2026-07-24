@@ -1,0 +1,55 @@
+# AI Research Assistant - Project Architecture, Flow, & Models Overview
+
+## 1. AI MODELS USED
+• Core LLM Engine: Groq API with `llama-3.1-8b-instant` 
+  Used for dynamic query routing, general chat, summarization, code generation, and RAG synthesis. It is highly optimized for extremely low latency.
+
+• Embedding Model: HuggingFace `all-MiniLM-L6-v2`
+  Runs locally on CPU. Used to convert document text and user queries into dense vectors for Pinecone search, as well as checking similarity for Semantic Caching.
+
+• Cross-Encoder (Reranking): `cross-encoder/ms-marco-MiniLM-L-6-v2`
+  Runs locally on CPU. Used to re-rank the retrieved documents from the hybrid search to ensure the absolute most relevant context is prioritized before being fed to the LLM.
+
+## 2. SYSTEM WORKFLOW & EXECUTION PATH (FLOW)
+Step 1: User Interaction (Frontend)
+• The user submits a query via the React (Vite) UI.
+• The query is sent to the FastAPI Backend via Server-Sent Events (SSE) at the `/chat/stream` endpoint for real-time streaming.
+
+Step 2: Semantic Caching (Redis / Upstash)
+• The backend immediately embeds the user's question and checks the Redis database.
+• If a highly similar question (≥98% semantic match) was asked previously, the cached answer is returned instantly. This bypasses the LLM entirely, saving API costs and time.
+• If it is a Cache Miss, the query proceeds to the Agent.
+
+Step 3: LangGraph Agent Router
+• The query enters the LangGraph State Machine.
+• A specialized LLM Router Node analyzes the query intent and classifies it into one of 5 specialized execution nodes:
+  1. RAG (Default): For questions regarding uploaded personal documents, resume, or facts.
+  2. Web: Uses DuckDuckGo for live internet data and news.
+  3. Math: Uses an AST eval script for pure arithmetic calculations.
+  4. Python: Uses PythonREPL tool to write and execute code.
+  5. LLM: Fallback for generic conversational knowledge (e.g., "hello").
+
+Step 4: The RAG Pipeline (If routed to RAG)
+• Preprocessing: The query is cleaned (stopwords/filler phrases removed) to maximize keyword search recall.
+• Hybrid Retrieval (Parallel): The query simultaneously searches:
+  - Pinecone Cloud Vector Store (Dense semantic search)
+  - In-memory BM25 (Sparse exact-keyword search)
+• Deduplication & Reranking: Results from both engines are merged, deduplicated, and scored against the user query using the CrossEncoder model. The top 5 highest-scoring chunks are kept.
+• Synthesis: The top 5 chunks + recent chat history are injected into the Groq `llama-3.1-8b-instant` LLM system prompt to generate the final, hallucination-free answer.
+
+Step 5: Delivery & Persistence
+• The generated text streams back to the frontend UI as the model thinks.
+• The updated conversation history and the new Question/Answer pair are saved securely to the Redis database for future interactions.
+
+## 3. DATA & STORAGE
+• Vector Data (Dense): Pinecone Cloud Database (384-dimensional vectors).
+• Sparse Data (Keywords): Local memory/disk using BM25 algorithms (chunks.pkl).
+• Semantic Cache & Session History: Redis Database.
+• Document Storage: Documents uploaded to local storage/memory for processing.
+
+## 4. CORE CONCEPTS HIGHLIGHTS
+• Agentic Routing (LangGraph): Dynamic, intent-based decision making instead of a fixed, linear pipeline. The AI decides which tools it needs.
+• Hybrid Search: Overcomes the weaknesses of dense-only search by combining exact keyword matching (BM25) with semantic meaning (Pinecone).
+• Re-ranking: A two-stage retrieval process that casts a wide net first, then meticulously scores candidates for pinpoint accuracy.
+• Enterprise Caching: Implementing Redis for semantic cache hits and persistent session history management, modeling production-grade enterprise systems.
+• Real-time Streaming (SSE): Providing immediate visual feedback to the user via Server-Sent Events, significantly improving UX over blocking requests.

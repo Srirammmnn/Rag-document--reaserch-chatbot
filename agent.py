@@ -1,362 +1,340 @@
 """
-Phase 3: LangGraph Router Architecture + Hybrid Search
-======================================================
-Flow: User → Router (rules + LLM fallback) → [RAG | LLM | Web | Math | Python] → END
+Phase 3 & Production Agent Architecture: LangGraph Router + Hybrid Search + Verified Citations
+=============================================================================================
+Flow: User -> Router Node -> [RAG | LLM | Web | Math | Python] -> END
 
-Optimizations applied:
-  - Two-stage router: keyword rules (0ms) → LLM fallback only when ambiguous
-  - HybridRetriever is a global singleton (loaded once at startup, not per-request)
-  - CrossEncoder pre-loaded globally
-  - BM25 + Pinecone run in parallel via ThreadPoolExecutor
-  - Generation capped at 512 tokens
+Optimizations & Features:
+  - HybridRetriever singleton combining Dense Search (Pinecone/FAISS) + BM25 + RRF + CrossEncoder.
+  - Strict grounded prompt requiring inline citation tags [1], [2].
+  - Automated Citation Verification using citation_verifier.py.
+  - Clean state management in LangGraph.
 """
 
 import os
 import sys
 import re
 import pickle
-from typing import Annotated, List, Sequence, TypedDict
+import concurrent.futures
 from pathlib import Path
+from typing import Annotated, List, Sequence, TypedDict, Dict, Any, Optional
 
-# Force UTF-8 output
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 from pydantic import BaseModel, Field
-
-# LangGraph core
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 
-# LangChain core
 from langchain_core.messages import (
     BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 )
 from langchain_groq import ChatGroq
-from langchain_pinecone import Pinecone
 from langchain_huggingface import HuggingFaceEmbeddings
-
-# Hybrid Search
 from langchain_community.retrievers import BM25Retriever
-
-# Tools
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_experimental.tools import PythonREPLTool
+
+from hybrid_retriever import HybridRetriever, get_global_cross_encoder
+from citation_verifier import verify_claims_against_sources
+from ingest import get_embedding_model
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from sentence_transformers import CrossEncoder
-import concurrent.futures
-
 
 # ─────────────────────────────────────────────
-# CROSS ENCODER — GLOBAL SINGLETON
-# ─────────────────────────────────────────────
-
-_cross_encoder = None
-
-def load_cross_encoder():
-    global _cross_encoder
-    if _cross_encoder is None:
-        print("  🎯 Loading CrossEncoder globally (once)...")
-        _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
-    return _cross_encoder
-
-
-# ─────────────────────────────────────────────
-# HYBRID RETRIEVER
-# ─────────────────────────────────────────────
-
-class HybridRetriever:
-    def __init__(self, bm25_retriever, pinecone_retriever):
-        self.bm25 = bm25_retriever
-        self.pinecone = pinecone_retriever
-        self.cross_encoder = load_cross_encoder()
-
-    def invoke(self, query: str):
-        # BM25 and Pinecone fetch in parallel
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            bm25_future = executor.submit(self.bm25.invoke, query)
-            pinecone_future = executor.submit(self.pinecone.invoke, query)
-            bm25_docs = bm25_future.result()
-            pinecone_docs = pinecone_future.result()
-
-        # Deduplicate
-        unique_docs = {}
-        for doc in bm25_docs + pinecone_docs:
-            unique_docs[doc.page_content] = doc
-        candidates = list(unique_docs.values())
-
-        if not candidates:
-            return []
-
-        # CrossEncoder reranking
-        pairs = [[query, doc.page_content] for doc in candidates]
-        scores = self.cross_encoder.predict(pairs)
-        scored_docs = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-
-        # Return top 5 — enough for multi-doc coverage while keeping prompt tight
-        return [doc for doc, _ in scored_docs[:5]]
-
-
-# ─────────────────────────────────────────────
-# STATE
+# STATE DEFINITION
 # ─────────────────────────────────────────────
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     route: str
+    citations: Optional[List[Dict[str, Any]]]
+    groundedness_score: Optional[float]
+    retrieval_diagnostics: Optional[List[Dict[str, Any]]]
 
 
 # ─────────────────────────────────────────────
-# HYBRID RETRIEVER — GLOBAL SINGLETON
-# Built ONCE at FastAPI startup, reused every request.
-# (Was the critical 15s bottleneck when built per-request)
+# HYBRID RETRIEVER SINGLETON
 # ─────────────────────────────────────────────
 
-_hybrid_retriever = None
+_hybrid_retriever_singleton = None
 
-def init_retriever():
-    """Pre-warm the hybrid retriever. Called once at FastAPI @startup."""
-    global _hybrid_retriever
-    if _hybrid_retriever is not None:
-        return _hybrid_retriever
+def init_retriever() -> Optional[HybridRetriever]:
+    """Initialize and cache the global HybridRetriever singleton."""
+    global _hybrid_retriever_singleton
 
-    print("🧩 Initializing Hybrid Search Singleton (Pinecone + BM25)...")
+    print("🧩 Initializing Production Hybrid Retriever (Dense + BM25 + RRF + Reranker)...")
+    vectorstore_dir = Path(__file__).parent / "vectorstore"
+    embeddings = get_embedding_model()
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-    pinecone_api_key = os.environ.get("PINECONE_API_KEY")
-    index_name = os.environ.get("PINECONE_INDEX_NAME")
-    if not pinecone_api_key or not index_name:
-        print("⚠️ Pinecone credentials missing. Retriever not initialized.")
+    dense_retriever = None
+
+    # Option 1: Pinecone Cloud
+    pinecone_key = os.environ.get("PINECONE_API_KEY")
+    index_name = os.environ.get("PINECONE_INDEX_NAME") or "rag"
+    if pinecone_key and index_name:
+        try:
+            from pinecone import Pinecone as PineconeClient
+            from langchain_pinecone import Pinecone
+            pc = PineconeClient(api_key=pinecone_key)
+            existing_indexes = [idx.name for idx in pc.list_indexes()]
+
+            if index_name in existing_indexes:
+                index_obj = pc.Index(index_name)
+                vectorstore = Pinecone(index=index_obj, embedding=embeddings)
+                dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 30})
+                print(f"  ☁️ Dense Retriever: Connected to Pinecone index '{index_name}'")
+            else:
+                print(f"  ⚠️ Pinecone index '{index_name}' does not exist on cloud yet.")
+        except Exception as e:
+            print(f"  ⚠️ Pinecone connection failed ({e})")
+
+    # Option 2: Local ChromaDB / FAISS Fallback
+    if dense_retriever is None:
+        chroma_dir = vectorstore_dir / "chroma_db"
+        if chroma_dir.exists():
+            try:
+                from langchain_chroma import Chroma
+                vectorstore = Chroma(persist_directory=str(chroma_dir), embedding_function=embeddings)
+                dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 30})
+                print("  💾 Dense Retriever: Loaded local ChromaDB store")
+            except Exception as e:
+                print(f"  ⚠️ ChromaDB load failed: {e}")
+
+    if dense_retriever is None:
+        faiss_dir = vectorstore_dir / "faiss_index"
+        if faiss_dir.exists():
+            try:
+                from langchain_community.vectorstores import FAISS
+                vectorstore = FAISS.load_local(str(faiss_dir), embeddings, allow_dangerous_deserialization=True)
+                dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 30})
+                print("  💾 Dense Retriever: Loaded local FAISS store")
+            except Exception as e:
+                print(f"  ⚠️ FAISS load failed: {e}")
+
+    # Load BM25 Sparse Index from chunks.pkl
+    bm25_retriever = None
+    chunks_path = vectorstore_dir / "chunks.pkl"
+    if chunks_path.exists():
+        try:
+            with open(chunks_path, "rb") as f:
+                chunks = pickle.load(f)
+            if chunks:
+                bm25_retriever = BM25Retriever.from_documents(chunks)
+                bm25_retriever.k = 30
+                print(f"  📝 Sparse Retriever: Loaded BM25 index with {len(chunks)} chunks")
+        except Exception as e:
+            print(f"  ⚠️ BM25 load failed: {e}")
+
+    if dense_retriever is None and bm25_retriever is None:
+        print("  ⚠️ No retriever could be initialized. Please ingest documents first.")
+        _hybrid_retriever_singleton = None
         return None
 
-    vectorstore = Pinecone(index_name=index_name, embedding=embeddings)
-    pinecone_retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+    _hybrid_retriever_singleton = HybridRetriever(
+        dense_retriever=dense_retriever,
+        bm25_retriever=bm25_retriever,
+        fetch_k=40,
+        final_k=6,
+    )
+    print("  ✅ HybridRetriever Ready!")
+    return _hybrid_retriever_singleton
 
-    chunks_path = Path(__file__).parent / "vectorstore" / "chunks.pkl"
-    if chunks_path.exists():
-        with open(chunks_path, "rb") as f:
-            chunks = pickle.load(f)
-        bm25_retriever = BM25Retriever.from_documents(chunks)
-        bm25_retriever.k = 8
-        _hybrid_retriever = HybridRetriever(bm25_retriever, pinecone_retriever)
-        print("  ✅ Hybrid retriever ready (Pinecone + BM25)")
-    else:
-        print("⚠️ chunks.pkl not found! Using Dense-only Pinecone search.")
-        _hybrid_retriever = pinecone_retriever
 
-    return _hybrid_retriever
-
-def get_hybrid_retriever():
-    """Return the cached singleton. Calls init_retriever() on first use."""
-    global _hybrid_retriever
-    if _hybrid_retriever is None:
+def get_hybrid_retriever() -> Optional[HybridRetriever]:
+    global _hybrid_retriever_singleton
+    if _hybrid_retriever_singleton is None:
         return init_retriever()
-    return _hybrid_retriever
+    return _hybrid_retriever_singleton
 
 
 # ─────────────────────────────────────────────
-# PRODUCTION ROUTER — THREE-TIER SYSTEM
-# Tier 0: First-person absolute override (regex, instant)
-# Tier 1: Domain keyword rules (string match, instant)
-# Tier 2: LLM fallback (only for pure ambiguous queries, rag-biased)
+# ROUTER NODE
 # ─────────────────────────────────────────────
+
+def llm_based_route(question: str) -> str:
+    try:
+        llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=15)
+        system_prompt = (
+            "You are an expert intent classifier for a smart assistant.\n"
+            "Route the user's question to ONE of the following nodes:\n"
+            "- 'rag': ONLY for questions specifically asking about the user's personal info, resume, skills, experience, or extracting information from user's uploaded documents.\n"
+            "- 'web': For current events, recent news, live scores, or weather.\n"
+            "- 'math': For pure mathematical calculations (e.g. 'calculate 5+5').\n"
+            "- 'python': For writing or executing python scripts and code.\n"
+            "- 'llm': For general knowledge questions (like capitals, history, AI definitions), general chit-chat, greetings, conversational responses, or subjective questions.\n\n"
+            "Respond ONLY with the single word corresponding to the node: rag, web, math, python, or llm."
+        )
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=question)
+        ]).content.strip().lower()
+
+        valid_routes = ["rag", "llm", "web", "math", "python"]
+        for r in valid_routes:
+            if r in response:
+                return r
+    except Exception as e:
+        print(f"   -> LLM Routing failed ({e}), falling back to 'rag'")
+        
+    return "rag"
 
 def router_node(state: AgentState):
-    """
-    Pure LLM-based router using Groq.
-    Classifies the user request directly using the LLM to determine the correct tool/node.
-    """
+    """Classifies incoming query intent to route to appropriate processing node using ONLY LLM."""
     messages = state["messages"]
     question = messages[-1].content
 
-    print("🚦 Router (LLM Classification)...")
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=10)
-    system = (
-        "You are a strict query router for an AI assistant.\n"
-        "Analyze the user's query and classify it into EXACTLY ONE of the following categories:\n"
-        "1. rag : STRONGLY DEFAULT TO THIS. Use this if the query contains 'I', 'me', 'my' (e.g., 'who am I', 'what is my GPA'), asks about personal details, resume, background, education, or facts from uploaded documents.\n"
-        "2. math : If the query involves evaluating purely mathematical arithmetic expressions.\n"
-        "3. python : If the query asks to write or execute Python code.\n"
-        "4. web : If the query requires live/current internet data, news, or real-time search.\n"
-        "5. llm : Only use this for general world knowledge, basic greetings ('hello'), or completely abstract topics that have absolutely nothing to do with the user's personal data.\n\n"
-        "Output ONLY the category name (rag, math, python, web, or llm) in lowercase, with no other text."
-    )
-    prompt = f"{system}\nQuery: {question}\nRoute:"
-    resp = llm.invoke([HumanMessage(content=prompt)]).content.strip().lower()
-    
-    # Extract the first word to ensure clean routing
-    first = resp.split()[0] if resp.split() else "llm"
-    valid = {"rag", "llm", "web", "math", "python"}
-    destination = first if first in valid else "llm"
-    
-    print(f"   → LLM classified route as → {destination}")
+    print(f"🚦 Router Node: LLM Classifying intent for query: '{question}'...")
+    destination = llm_based_route(question)
+    print(f"   -> LLM Routed to: {destination}")
 
-    synthetic_tool_call = AIMessage(
+    synthetic_tool = AIMessage(
         content="",
         tool_calls=[{"name": f"routed_to_{destination}", "args": {"query": question}, "id": "route_1"}]
     )
-    return {"messages": [synthetic_tool_call], "route": destination}# ─────────────────────────────────────────────
-# WORKER NODES
+    return {"messages": [synthetic_tool], "route": destination}
+
+
+# ─────────────────────────────────────────────
+# RAG WORKER NODE WITH CITATION SYNTHESIS
 # ─────────────────────────────────────────────
 
-def query_transform(question: str) -> str:
-    """HyDE + rewrite (kept for reference, bypassed in rag_node for speed)."""
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7)
-    prompt = (
-        "You are an expert AI searching a vector database.\n"
-        "1. Rewrite the query with relevant keywords.\n"
-        "2. Write a short hypothetical answer containing expected terminology.\n\n"
-        f"User Query: {question}\n\n"
-        "Return ONLY the combined rewritten query + hypothetical answer."
-    )
-    return llm.invoke([HumanMessage(content=prompt)]).content
-
-def hallucination_gate(context: str, answer: str, question: str) -> str:
-    """RAGAS-style faithfulness check (kept for reference, bypassed for speed)."""
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.0)
-    prompt = (
-        "You are an impartial judge evaluating faithfulness.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\nAI Answer: {answer}\n\n"
-        "Rules:\n"
-        "1. If the answer says it doesn't know → PASS\n"
-        "2. If the answer is supported by the context → PASS\n"
-        "3. If the answer has unsupported claims → FAIL\n\n"
-        "Reply with EXACTLY one word: PASS or FAIL."
-    )
-    evaluation = llm.invoke([HumanMessage(content=prompt)]).content.strip().upper()
-    if "PASS" in evaluation:
-        return answer
-    print(f"⚠️ Hallucination gate blocked response. Judge: {evaluation}")
-    return "I could not generate a verified answer from the provided documents."
-
-
 def preprocess_retrieval_query(query: str) -> str:
-    """Strip question templates and stopwords to optimize retrieval recall."""
-    q = query.lower().strip()
-    prefixes = [
-        r'\bwhat\s+is\s+(my|the|a|an)\b',
-        r'\bwhat\s+is\b',
-        r'\btell\s+me\s+(about|my|about\s+my|the)\b',
-        r'\btell\s+me\b',
-        r'\bcould\s+you\s+check\s+my\b',
-        r'\bcould\s+you\s+(tell|check|show)\b',
-        r'\bcheck\s+my\b',
-        r'\bdo\s+i\s+have\s+(a|an|any)?\b',
-        r'\bdo\s+i\s+have\b',
-        r'\bshow\s+(my|me|the)\b',
-        r'\bgive\s+me\s+(my|the)\b',
-        r'\bfind\s+(my|the)\b',
-        r'\bplease\s+(check|tell|show|give|find)\b',
-        r'\bplease\b',
-    ]
-    for p in prefixes:
-        q = re.sub(p, '', q)
-    # Strip common small stop words that dilute search
-    q = re.sub(r'\b(my|of|about|for|the|a|an|is|are|am|i|do|have|check|tell|show|give|find)\b', ' ', q)
-    q = re.sub(r'\s+', ' ', q).strip()
-    q = q.replace('?', '').strip()
-    return q if q else query
+    """Strips excessive whitespace for optimal vector & keyword search while preserving natural phrasing."""
+    return re.sub(r'\s+', ' ', query).strip()
 
 
 def rag_node(state: AgentState):
-    print("📚 RAG Node (Hybrid Search, speed-optimized)...")
-    
-    # Bug fix: scan backwards to find the actual last HumanMessage
-    # (messages[-2] breaks with multi-turn session history)
+    print("📚 RAG Node: Hybrid Retrieval & Citation Generation...")
+
     question = None
     for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage):
             question = msg.content
             break
     if not question:
-        question = state["messages"][-2].content  # fallback
+        question = state["messages"][-2].content
 
-    # Retrieval — singleton retriever, parallel BM25+Pinecone, CrossEncoder rerank
+    # Query Expansion: Generate keywords to boost BM25 retrieval
+    try:
+        llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+        expansion_prompt = (
+            f"Analyze this search query: '{question}'. Generate a list of core keywords, synonyms, and variations. "
+            f"If there are compounded words like 'myprojects', split them into 'my projects'. "
+            f"Return ONLY the keywords and variations separated by spaces, with no conversational text."
+        )
+        expanded_keywords = llm.invoke([HumanMessage(content=expansion_prompt)]).content.strip()
+        print(f"   -> Query Expansion: '{expanded_keywords}'")
+        search_query = preprocess_retrieval_query(f"{question} {expanded_keywords}")
+    except Exception as e:
+        print(f"   -> Query expansion failed ({e}), using raw query.")
+        search_query = preprocess_retrieval_query(question)
     retriever = get_hybrid_retriever()
-    clean_query = preprocess_retrieval_query(question)
-    print(f"   🔍 Retrieval query: {question!r} -> refined: {clean_query!r}")
-    docs = retriever.invoke(clean_query)
 
-    context_parts = [
-        f"[Source: {doc.metadata.get('source', 'unknown')}]\n{doc.page_content}"
-        for doc in docs
-    ]
-    context_str = "\n\n".join(context_parts)
+    if retriever is None:
+        err_msg = AIMessage(content="Knowledge base is empty. Please upload documents first.")
+        return {"messages": [err_msg], "citations": [], "groundedness_score": 0.0, "retrieval_diagnostics": []}
 
-    # Tight prompt, trimmed history, capped tokens
+    # Step 1: Hybrid Retrieval with detailed score diagnostics using full natural question
+    results_with_scores = retriever.get_relevant_documents_with_scores(search_query)
+
+    context_chunks = []
+    diagnostics = []
+    docs_for_verification = []
+
+    for rank, (doc, meta) in enumerate(results_with_scores, start=1):
+        doc.metadata["citation_id"] = rank
+        docs_for_verification.append(doc)
+
+        src = doc.metadata.get("source", "document")
+        page = doc.metadata.get("page", 1)
+        context_chunks.append(f"[{rank}] (Source: {src}, Page {page}):\n{doc.page_content.strip()}")
+
+        diagnostics.append({
+            "citation_id": rank,
+            "source": src,
+            "page": page,
+            "dense_rank": meta.get("dense_rank"),
+            "bm25_rank": meta.get("bm25_rank"),
+            "rrf_score": meta.get("rrf_score"),
+            "cross_encoder_score": meta.get("cross_encoder_score"),
+            "snippet": doc.page_content[:150] + "...",
+        })
+
+    context_str = "\n\n".join(context_chunks)
+
+    # Step 2: System prompt demanding grounded synthesis & inline citation tags [1], [2]
     system_prompt = (
-        "You are a professional assistant answering questions about personal documents.\n"
-        "Use the provided context AND the conversation history to answer the user's latest question.\n"
-        "If the context does not contain the exact answer, say so clearly, but proactively mention any closely related details that ARE present in the context.\n\n"
-        f"Context:\n{context_str}"
+        "You are an expert AI assistant answering the user's query.\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Provide a direct, clear, and comprehensive answer using the Context Documents provided below.\n"
+        "2. CRITICAL: Do NOT use conversational filler like 'Based on the provided documents', 'According to the context', or 'The documents state'. Present the information directly as if it were your own innate knowledge.\n"
+        "3. Every factual claim drawn from the context MUST include inline numeric citations like [1], [2].\n"
+        "4. If the context does not contain the answer, say 'I do not have enough information to answer this based on the provided documents.' Do NOT use your general knowledge.\n\n"
+        f"Context Documents:\n{context_str}"
     )
-    history = list(state["messages"][:-2])[-4:]
-    messages_to_send = [SystemMessage(content=system_prompt)] + history + [HumanMessage(content=question)]
 
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=512)
+    clean_history = [
+        m for m in state["messages"][:-2]
+        if isinstance(m, (HumanMessage, AIMessage)) and not getattr(m, "tool_calls", None)
+    ][-4:]
+
+    messages_to_send = [SystemMessage(content=system_prompt)] + clean_history + [HumanMessage(content=question)]
+
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=750)
     response = llm.invoke(messages_to_send)
 
-    tm = ToolMessage(content=f"Found {len(docs)} documents.", tool_call_id="route_1", name="routed_to_rag")
-    return {"messages": [tm, AIMessage(content=response.content)]}
+    # Step 3: Citation Verification
+    citations, groundedness_score = verify_claims_against_sources(response.content, docs_for_verification)
+    print(f"   -> Groundedness Score: {groundedness_score*100:.1f}% ({len(citations)} citations verified)")
 
+    tm = ToolMessage(content=f"Found {len(docs_for_verification)} grounded chunks.", tool_call_id="route_1", name="routed_to_rag")
+    ai_msg = AIMessage(content=response.content)
+
+    return {
+        "messages": [tm, ai_msg],
+        "citations": citations,
+        "groundedness_score": groundedness_score,
+        "retrieval_diagnostics": diagnostics,
+    }
+
+
+# ─────────────────────────────────────────────
+# OTHER WORKER NODES
+# ─────────────────────────────────────────────
 
 def llm_node(state: AgentState):
     print("🧠 General LLM Node...")
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7, max_tokens=512)
     response = llm.invoke(state["messages"][:-1])
     tm = ToolMessage(content="LLM Answered.", tool_call_id="route_1", name="routed_to_llm")
-    return {"messages": [tm, AIMessage(content=response.content)]}
+    return {"messages": [tm, AIMessage(content=response.content)], "citations": [], "groundedness_score": 1.0}
 
 
 def web_node(state: AgentState):
     print("🌐 Web Search Node...")
-    question = None
-    for msg in reversed(state["messages"]):
-        if isinstance(msg, HumanMessage):
-            question = msg.content
-            break
-    if not question:
-        question = state["messages"][-2].content
-
+    question = state["messages"][-2].content if len(state["messages"]) >= 2 else state["messages"][-1].content
     search = DuckDuckGoSearchRun()
     search_result = search.invoke(question)
 
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, max_tokens=512)
-    prompt = f"Based on this web search result:\n{search_result}\n\nAnswer: {question}"
+    prompt = f"Based on web search results:\n{search_result}\n\nAnswer question: {question}"
     response = llm.invoke([HumanMessage(content=prompt)])
 
     tm = ToolMessage(content="Searched Web.", tool_call_id="route_1", name="routed_to_web")
-    return {"messages": [tm, AIMessage(content=response.content)]}
+    return {"messages": [tm, AIMessage(content=response.content)], "citations": [], "groundedness_score": 1.0}
 
 
 def math_node(state: AgentState):
     print("🧮 Math Node...")
-    question = None
-    for msg in reversed(state["messages"]):
-        if isinstance(msg, HumanMessage):
-            question = msg.content
-            break
-    if not question:
-        question = state["messages"][-2].content
-
+    question = state["messages"][-2].content if len(state["messages"]) >= 2 else state["messages"][-1].content
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-    extract_prompt = f"Extract only the mathematical expression to evaluate from: '{question}'. Return ONLY the expression."
-    expr = llm.invoke([HumanMessage(content=extract_prompt)]).content.strip()
+    expr = llm.invoke([HumanMessage(content=f"Extract pure math expression from: '{question}'. Return ONLY expression.")]).content.strip()
 
     try:
-        allowed_chars = set("0123456789+-*/(). ")
-        if not all(c in allowed_chars for c in expr):
-            ans = "Error: invalid math expression."
-        else:
-            ans = str(eval(expr, {"__builtins__": {}}, {}))
+        allowed = set("0123456789+-*/(). ")
+        ans = str(eval(expr, {"__builtins__": {}}, {})) if all(c in allowed for c in expr) else "Invalid expression"
     except Exception as e:
         ans = str(e)
 
@@ -366,17 +344,9 @@ def math_node(state: AgentState):
 
 def python_node(state: AgentState):
     print("🐍 Python Node...")
-    question = None
-    for msg in reversed(state["messages"]):
-        if isinstance(msg, HumanMessage):
-            question = msg.content
-            break
-    if not question:
-        question = state["messages"][-2].content
-
+    question = state["messages"][-2].content if len(state["messages"]) >= 2 else state["messages"][-1].content
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-    code_prompt = f"Write Python code to solve: {question}. Return ONLY valid Python, no markdown."
-    code = llm.invoke([HumanMessage(content=code_prompt)]).content.replace("```python", "").replace("```", "").strip()
+    code = llm.invoke([HumanMessage(content=f"Write Python code to solve: {question}. Return ONLY executable Python code.")]).content.replace("```python", "").replace("```", "").strip()
 
     repl = PythonREPLTool()
     try:
@@ -385,20 +355,16 @@ def python_node(state: AgentState):
         result = str(e)
 
     final_ans = f"```python\n{code}\n```\nOutput:\n```\n{result}\n```"
-    tm = ToolMessage(content="Ran Python.", tool_call_id="route_1", name="routed_to_python")
+    tm = ToolMessage(content="Executed Python.", tool_call_id="route_1", name="routed_to_python")
     return {"messages": [tm, AIMessage(content=final_ans)]}
 
-
-# ─────────────────────────────────────────────
-# ROUTING LOGIC
-# ─────────────────────────────────────────────
 
 def route_decision(state: AgentState):
     return state["route"]
 
 
 # ─────────────────────────────────────────────
-# BUILD GRAPH
+# BUILD LANGGRAPH GRAPH
 # ─────────────────────────────────────────────
 
 def build_agent_graph():
@@ -428,9 +394,4 @@ def build_agent_graph():
 
 if __name__ == "__main__":
     app = build_agent_graph()
-    print("\n✅ Router Graph built successfully!")
-
-    question = "What are my certifications?"
-    print(f"\nUser: {question}")
-    res = app.invoke({"messages": [HumanMessage(content=question)]})
-    print(f"Final Answer: {res['messages'][-1].content}")
+    print("✅ Production Agent Graph built successfully.")

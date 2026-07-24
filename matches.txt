@@ -1,0 +1,51 @@
+PROJECT EXPERIENCE  
+Enterprise RAG + Agentic Knowledge Assistant 
+• Built a production-grade RAG system using LangChain, LangGraph, and FAISS/Qdrant with agent -based query routing between 
+retrieval and direct LLM responses. 
+• Implemented hybrid search (Hugging Face embeddings + BM25 + cross -encoder reranking) with RRF fusion and HyDE query 
+transformation, improving retrieval precision by 31%.
+
+---MATCH---
+
+2. Internship & Stipend: The first six (6) months  of your engagement with the Company shall 
+be treated as an  Internship Period, during which you will be trained on the foundational 
+skillsets required to interact with team members and work on live projects. As you are joining 
+as a fresher, this training period is intended to equip you with the necessary professional and 
+technical competencies expected by the Company. 
+3. During the Internship Period, you shall receive a  stipend of INR 10,000/ - (Rupees Ten 
+Thousand Only) per month, which will be payable only upon successful completion of the full 
+six-month internship. The stipend shall be released to your designated bank account at the 
+end of the internship period, subject to successful completion and satisfactory performance 
+as determined by the Company. 
+4. In the event you choose to discontinue your internship or your internship is terminated by
+
+---MATCH---
+
+shifts as required by the business. 
+7. Verification: As part of the organization procedure, we may carry out background verification 
+check of employees joining us. 
+8. Compensation: On successful completion of your internship period of 6 months and 
+absorption into the company, you will be designated as Software Engineer – Trainee with the 
+Annual Cost to Company (CTC) of ₹ 4,25,000 (₹ Four Lakhs Twenty-Five Thousand only). 
+9. Working Hours: You shall be present in the office or logging in during normal working hours 
+(9:00 am to 6:00 pm) as ROR policies. In case you are attached to any project where the client 
+may have requirement of recording specific time -efforts, you shall comply with such 
+requirement as well. 
+10. Statutory Deductions: On successful completion of the Internship period of 6 months and 
+absorption into the company, ROR Technologies shall make necessary statutory deductions 
+from your gross salary and directly pay on your behalf to the concerned authorities.
+
+---MATCH---
+
+period, subject to a minimum repayment equal to one (1) year's gross annual compensation at 
+the time of exit. The specific amount payable by you will be communicated in writing and 
+must be remitted prior to your final settlement. 
+22. The company shall have the right to suspend you on full pay and benefits pending any 
+investigation into potential dishonesty, gross misconduct, misappropriation, gross negligence, 
+fraud or other circumstances (if proved) would entitle the Company to dismiss your services 
+summarily. 
+23. Damages: You are aware that to fulfil your assignment, it will be necessary for ROR 
+Technologies to make substantial efforts and incur expenses. If you breach this agreement, 
+by leaving a project in violation of this agreement, ROR Technologies shall have the right to 
+seek actual damages, including direct and consequential damages and loss of profits. In any 
+action to enforce this Agreement, the prevailing party may recover, in addition to damages

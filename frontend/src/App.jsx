@@ -1,11 +1,9 @@
 import { useState, useRef, useEffect } from 'react';
-import { Bot, Send, User, Upload, Settings, RefreshCw, FileText, ChevronRight, Layers, Database, AlertCircle } from 'lucide-react';
+import { Bot, Send, User, Upload, Settings, RefreshCw, FileText, ChevronRight, Layers, Database, AlertCircle, Trash2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
 import './App.css';
-
-const API_URL = "/api";
-
+const API_URL = "http://localhost:8000";
 function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -63,8 +61,7 @@ function App() {
     const formData = new FormData();
     formData.append('file', file);
 
-    // Set uploading state (we can use health status as a proxy for UI)
-    const toastId = addToast(`Uploading ${file.name}...`, 'info');
+    addToast(`Uploading ${file.name}...`, 'info');
     
     try {
       const res = await fetch(`${API_URL}/ingest`, {
@@ -74,14 +71,37 @@ function App() {
       
       if (res.ok) {
         const data = await res.json();
-        addToast(`Successfully added ${data.chunks_added} chunks!`, 'success');
+        addToast(`Successfully ingested '${file.name}' (${data.chunks_added} chunks)!`, 'success');
         fetchSources();
         checkHealth();
       } else {
-        addToast(`Upload failed: ${res.statusText}`, 'error');
+        const errJson = await res.json().catch(() => ({}));
+        addToast(`Upload failed: ${errJson.detail || res.statusText}`, 'error');
       }
     } catch (err) {
-      addToast(`Error: ${err.message}`, 'error');
+      addToast(`Error uploading: ${err.message}`, 'error');
+    } finally {
+      if (e.target) e.target.value = '';
+    }
+  };
+
+  const handleDeleteSource = async (filename) => {
+    if (!window.confirm(`Are you sure you want to delete '${filename}'?`)) return;
+
+    addToast(`Deleting ${filename}...`, 'info');
+    try {
+      const res = await fetch(`${API_URL}/sources/${encodeURIComponent(filename)}`, {
+        method: 'DELETE',
+      });
+      if (res.ok) {
+        addToast(`Successfully deleted ${filename}`, 'success');
+        fetchSources();
+        checkHealth();
+      } else {
+        addToast(`Failed to delete file: ${res.statusText}`, 'error');
+      }
+    } catch (err) {
+      addToast(`Error deleting file: ${err.message}`, 'error');
     }
   };
 
@@ -229,7 +249,7 @@ function App() {
           <label className="upload-btn">
             <Upload size={16} />
             <span>Ingest Document</span>
-            <input type="file" hidden accept=".pdf,.txt" onChange={handleFileUpload} />
+            <input type="file" hidden accept=".pdf,.txt,.md,.PDF,.TXT,.MD" onChange={handleFileUpload} />
           </label>
           
           <div className="sources-list">
@@ -239,12 +259,24 @@ function App() {
             {(!sourcesInfo || !sourcesInfo.sources || sourcesInfo.sources.length === 0) ? (
               <div className="empty-sources">No documents indexed</div>
             ) : (
-              sourcesInfo.sources.map((s, i) => (
-                <div key={i} className="source-item">
-                  <FileText size={14} />
-                  <span className="truncate">{typeof s === 'string' ? s : JSON.stringify(s)}</span>
-                </div>
-              ))
+              sourcesInfo.sources.map((s, i) => {
+                const filename = typeof s === 'string' ? s : JSON.stringify(s);
+                return (
+                  <div key={i} className="source-item">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', overflow: 'hidden' }}>
+                      <FileText size={14} style={{ flexShrink: 0 }} />
+                      <span className="truncate" title={filename}>{filename}</span>
+                    </div>
+                    <button 
+                      className="delete-source-btn" 
+                      onClick={() => handleDeleteSource(filename)}
+                      title={`Delete ${filename}`}
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                );
+              })
             )}
           </div>
         </div>

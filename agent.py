@@ -33,7 +33,7 @@ from langchain_groq import ChatGroq
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_experimental.tools import PythonREPLTool
 
-from hybrid_retriever import HybridRetriever, get_global_cross_encoder
+from hybrid_retriever import HybridRetriever
 from ingest import get_embedding_model
 
 from dotenv import load_dotenv
@@ -68,8 +68,7 @@ def get_hybrid_retriever() -> Optional[HybridRetriever]:
     if _hybrid_retriever_singleton is not None:
         return _hybrid_retriever_singleton
 
-    print("🧩 Initializing Hybrid Retriever...")
-    vectorstore_dir = Path(__file__).parent / "vectorstore"
+    print("🧩 Initializing Dense Retriever for Vercel...")
     embeddings = get_embedding_model()
 
     dense_retriever = None
@@ -81,7 +80,7 @@ def get_hybrid_retriever() -> Optional[HybridRetriever]:
             from pinecone import Pinecone as PineconeClient
             from langchain_pinecone import Pinecone
             pc = PineconeClient(api_key=pinecone_key)
-            existing_indexes = [idx.name for idx in pc.list_indexes()]
+            existing_indexes = pc.list_indexes().names()
             if index_name in existing_indexes:
                 index_obj = pc.Index(index_name)
                 vectorstore = Pinecone(index=index_obj, embedding=embeddings)
@@ -89,25 +88,11 @@ def get_hybrid_retriever() -> Optional[HybridRetriever]:
         except Exception as e:
             print(f"  ⚠️ Pinecone connection failed ({e})")
 
-    bm25_retriever = None
-    chunks_path = vectorstore_dir / "chunks.pkl"
-    if chunks_path.exists():
-        try:
-            with open(chunks_path, "rb") as f:
-                chunks = pickle.load(f)
-            if chunks:
-                from langchain_community.retrievers import BM25Retriever
-                bm25_retriever = BM25Retriever.from_documents(chunks)
-                bm25_retriever.k = 30
-        except Exception as e:
-            print(f"  ⚠️ BM25 load failed: {e}")
-
-    if dense_retriever is None and bm25_retriever is None:
+    if dense_retriever is None:
         return None
 
     _hybrid_retriever_singleton = HybridRetriever(
         dense_retriever=dense_retriever,
-        bm25_retriever=bm25_retriever,
         fetch_k=40,
         final_k=6,
     )

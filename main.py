@@ -25,7 +25,7 @@ if sys.stdout.encoding != 'utf-8':
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -151,6 +151,10 @@ class VerifyCitationRequest(BaseModel):
 # ─────────────────────────────────────────────
 # ENDPOINTS
 # ─────────────────────────────────────────────
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/docs")
 
 @app.get("/health", response_model=HealthResponse)
 async def health():

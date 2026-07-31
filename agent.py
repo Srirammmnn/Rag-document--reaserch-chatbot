@@ -192,8 +192,8 @@ def sql_node(state: AgentState):
     if not supabase_url:
         return {"worker_data": "SQL Agent failed: SUPABASE_DATABASE_URL is not set in .env."}
     
-    # Langchain's sync SQLDatabase prefers standard postgresql string (psycopg2)
-    sync_url = supabase_url.replace("postgresql+asyncpg://", "postgresql://")
+    # Langchain's sync SQLDatabase can use pg8000
+    sync_url = supabase_url.replace("postgresql+asyncpg://", "postgresql+pg8000://").replace("postgresql://", "postgresql+pg8000://")
     
     try:
         from langchain_community.utilities import SQLDatabase

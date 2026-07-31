@@ -2,10 +2,10 @@
 Phase 4: Streamlit UI — Animated RAG Chatbot
 =============================================
 """
-import json, uuid, time, requests
+import json, uuid, time, requests, os
 import streamlit as st
 
-API_URL = "http://localhost:8000"
+API_URL = os.environ.get("API_URL", "http://localhost:8000")
 
 st.set_page_config(page_title="RAG Agent", page_icon="🤖", layout="wide")
 

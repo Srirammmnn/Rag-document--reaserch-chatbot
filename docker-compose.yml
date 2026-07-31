@@ -15,11 +15,14 @@ services:
 
   frontend:
     build:
-      context: ./frontend
+      context: .
       dockerfile: Dockerfile
     container_name: neurag_frontend
+    command: ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
     ports:
-      - "5173:80"  # Exposes the React app on port 5173
+      - "8501:8501"
+    environment:
+      - API_URL=http://backend:8000
     depends_on:
       - backend
     restart: unless-stopped

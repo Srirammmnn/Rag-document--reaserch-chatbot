@@ -1,0 +1,42 @@
+=============================================================
+             MODELS USED IN THE RAG SYSTEM
+=============================================================
+
+1. Llama-3.1-8b-instant (via Groq API)
+-------------------------------------------------------------
+Type: Large Language Model (LLM) / Generative Text Model
+Files: agent.py, ragas_eval.py
+
+Primary Uses:
+- Intent Classification (Router): Decides if a user's query should be routed to the RAG database, Web Search, Math calculator, Python executor, or General chat.
+- Query Expansion: Analyzes user queries to generate synonyms and split compounded words (e.g., "myprojects" -> "my projects", "portfolio") before hitting the database, ensuring higher retrieval success.
+- RAG Synthesis: Reads the retrieved document chunks and generates the final human-readable answer, inserting numeric inline citations (e.g., [1], [2]) for factual claims.
+- RAGAS Evaluation (Judge): Used as an automated "judge" to score the system's performance on metrics like Faithfulness and Answer Relevancy during testing.
+
+
+2. all-MiniLM-L6-v2 (via HuggingFace Embeddings)
+-------------------------------------------------------------
+Type: Dense Semantic Embedding Model
+Files: ingest.py, hybrid_retriever.py
+
+Primary Uses:
+- Document Ingestion: Converts all your PDF and text document chunks into dense mathematical vectors (embeddings) that capture the underlying "meaning" and context of the text.
+- Semantic Search (Dense Retrieval): When you ask a question, this model converts your question into a vector and finds chunks that are conceptually similar, even if they don't use the exact same words.
+
+
+3. cross-encoder/ms-marco-MiniLM-L-6-v2 (HuggingFace)
+-------------------------------------------------------------
+Type: Cross-Encoder / Re-ranking Model
+Files: hybrid_retriever.py
+
+Primary Uses:
+- Precision Re-ranking: Once the system fetches the top 40 candidate chunks from Dense search and BM25 search, it passes them to this model. The Cross-Encoder scores the user's exact query directly against every single chunk to determine the truest relevance. It filters out noise and returns only the absolute top 6 best chunks to the LLM for synthesis.
+
+
+4. BM25 (Okapi BM25)
+-------------------------------------------------------------
+Type: Sparse Keyword Search Algorithm (Not a neural model, but a critical search algorithm)
+Files: ingest.py, hybrid_retriever.py
+
+Primary Uses:
+- Exact Keyword Matching: Operates alongside the Dense Embeddings model. While Embeddings find "conceptual" matches, BM25 ensures that if you search for a highly specific keyword (like an ID number, name, or specific project title), it will retrieve the document containing that exact word.

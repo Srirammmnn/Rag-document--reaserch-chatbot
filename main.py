@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 from ingest import run_ingestion_pipeline, delete_document_from_stores, get_embedding_model
-from agent import build_agent_graph, init_retriever, get_hybrid_retriever, _hybrid_retriever_singleton
+from agent import build_agent_graph, get_hybrid_retriever
 import agent as agent_module
 from citation_verifier import verify_claims_against_sources
 
@@ -184,9 +184,9 @@ async def ingest_document(file: UploadFile = File(...)):
     try:
         res = run_ingestion_pipeline(file_path, VECTORSTORE_PATH)
 
-        # Invalidate retriever singleton and reinitialize
+        import agent as agent_module
         agent_module._hybrid_retriever_singleton = None
-        init_retriever()
+        get_hybrid_retriever()
 
         return {
             "filename": file.filename,
@@ -346,8 +346,9 @@ async def list_sources():
 async def delete_source(filename: str):
     try:
         res = delete_document_from_stores(filename, VECTORSTORE_PATH)
+        import agent as agent_module
         agent_module._hybrid_retriever_singleton = None
-        init_retriever()
+        get_hybrid_retriever()
         return {
             "status": "success",
             "filename": filename,
@@ -374,7 +375,7 @@ async def startup_event():
     print("  🚀 NeuRAG Production API Starting Up")
     print("=" * 60)
     get_embedding_model()
-    init_retriever()
+    get_hybrid_retriever()
     print("  ✅ Backend ready at http://localhost:8000")
     print("=" * 60 + "\n")
 

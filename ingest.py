@@ -24,7 +24,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 _embeddings_singleton = None
 
-def get_embedding_model(model_name: str = "models/embedding-001") -> GoogleGenerativeAIEmbeddings:
+def get_embedding_model(model_name: str = "models/text-embedding-004") -> GoogleGenerativeAIEmbeddings:
     """Singleton getter for Google embedding model."""
     global _embeddings_singleton
     if _embeddings_singleton is None:

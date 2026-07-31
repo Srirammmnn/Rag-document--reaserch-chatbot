@@ -146,8 +146,9 @@ def delete_document_from_stores(filename: str, vectorstore_path: Path) -> dict:
         except Exception as e:
             print(f"  ⚠️ Pinecone deletion failed: {e}")
 
-    # 2. Remove raw file from uploads/
-    uploads_dir = vectorstore_path.parent / "uploads"
+    # 2. Remove raw file from /tmp
+    import tempfile
+    uploads_dir = Path(tempfile.gettempdir())
     file_path = uploads_dir / filename
     if file_path.exists():
         try:

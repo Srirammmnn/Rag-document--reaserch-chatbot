@@ -57,9 +57,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+import tempfile
 VECTORSTORE_PATH = Path(__file__).parent / "vectorstore"
-UPLOAD_DIR = Path(__file__).parent / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR = Path(tempfile.gettempdir())
 
 _agent_graph = None
 
